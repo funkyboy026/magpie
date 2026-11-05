@@ -57,6 +57,10 @@ func TestPlaceholderNotePlaces(t *testing.T) {
 		{"anthropic system blocks", provider.Anthropic, `{"model":"m","system":[{"type":"text","text":"a"},{"type":"text","text":"b ` + ph + `","cache_control":{"type":"ephemeral"}}],"messages":[]}`, "system.2.text", "system.1"},
 		{"anthropic tools", provider.Anthropic, `{"model":"m","tools":[{"name":"t","description":"` + ph + `"}],"messages":[{"role":"user","content":"x"}]}`, "system", "messages"},
 		{"anthropic message", provider.Anthropic, `{"model":"m","system":"S","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"user","content":"mail ` + ph + `"}]}`, "messages.2.content.1.text", "messages.1"},
+		{"anthropic tool call", provider.Anthropic, `{"model":"m","system":"S","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"text","text":"run it"},{"type":"tool_use","id":"t1","name":"f","input":{"to":"` + ph + `"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}`, "messages.2.content.1.text", "messages.1"},
+		{"anthropic parallel tool calls", provider.Anthropic, `{"model":"m","system":"S","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"s"},{"type":"tool_use","id":"t1","name":"f","input":{"to":"` + ph + `"}},{"type":"tool_use","id":"t2","name":"f","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"},{"type":"tool_result","tool_use_id":"t2","content":"ok"}]},{"role":"assistant","content":"done"}]}`, "messages.2.content.2.text", "messages.1"},
+		{"anthropic assistant text", provider.Anthropic, `{"model":"m","system":"S","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"text","text":"mail ` + ph + `"}]},{"role":"user","content":"ok"}]}`, "messages.1.content.1.text", "messages.2"},
+		{"anthropic server tool", provider.Anthropic, `{"model":"m","system":"S","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"server_tool_use","id":"s1","name":"web_search","input":{"query":"` + ph + `"}},{"type":"web_search_tool_result","tool_use_id":"s1","content":[]}]},{"role":"user","content":"ok"}]}`, "messages.1.content.2.text", "messages.2"},
 		{"anthropic tool result", provider.Anthropic, `{"model":"m","system":"S","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"` + ph + `"}]}]}`, "messages.0.content.1.text", "system"},
 		{"chat system", provider.Chat, `{"model":"m","messages":[{"role":"user","content":"u"},{"role":"system","content":"S ` + ph + `"}]}`, "messages.1.content", "messages.0"},
 		{"chat developer parts", provider.Chat, `{"model":"m","messages":[{"role":"developer","content":[{"type":"text","text":"S ` + ph + `"}]},{"role":"user","content":"u"}]}`, "messages.0.content.1.text", "messages.1"},
@@ -92,6 +96,11 @@ func TestPlaceholderNotePlaces(t *testing.T) {
 				t.Fatalf("not stable:\n%s\n%s", out, again)
 			}
 		})
+	}
+	// a tool call with no results after it has no place for the note
+	unanswered := `{"model":"m","system":"S","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{"to":"` + ph + `"}}]}]}`
+	if out := withPlaceholderNote(provider.Anthropic, []byte(unanswered)); string(out) != unanswered {
+		t.Fatalf("a call with no results changed: %s", out)
 	}
 	// a string input stays the user's message, after the note
 	out := withPlaceholderNote(provider.Responses, []byte(`{"model":"m","instructions":"I","input":"hello `+ph+`"}`))
@@ -184,5 +193,66 @@ func TestMaskedRequestTold(t *testing.T) {
 	b3 := sent(`{"model":"fake/m1","max_tokens":10,"system":"Be brief.","messages":[{"role":"user","content":"hello"}]}`)
 	if strings.Contains(string(b3), placeholderNote) || gjson.GetBytes(b3, "system").String() != "Be brief." {
 		t.Fatalf("told with nothing masked: %s", b3)
+	}
+}
+
+// Through the gateway: a value first seen in a tool call's input leaves the
+// call the last thing in its turn. DeepSeek's Anthropic API answers text
+// after a tool_use with this 400, and as the history doesn't change, on
+// every later turn; Claude Code shows it as "tool use concurrency issues".
+func TestMaskedToolCallToldAfterItsResults(t *testing.T) {
+	const key = "sk-proj-abcdEFGH1234ijklMNOP5678qrst"
+	var mu sync.Mutex
+	var got []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		got = b
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		for _, m := range gjson.GetBytes(b, "messages").Array() {
+			blocks := m.Get("content").Array()
+			if hasToolUse(m) && blocks[len(blocks)-1].Get("type").String() != "tool_use" {
+				w.WriteHeader(400)
+				io.WriteString(w, "{\"error\":{\"message\":\"messages.1.2: `tool_use` ids were found without `tool_result` blocks immediately after: call_00_a. Each `tool_use` block must have a corresponding `tool_result` block in the next message.\",\"type\":\"invalid_request_error\"},\"type\":\"error\"}")
+				return
+			}
+		}
+		io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"m1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}`)
+	}))
+	defer up.Close()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"m1"}, Anthropic: up.URL + "/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.Save(settings.Settings{Redact: true}); err != nil {
+		t.Fatal(err)
+	}
+	sent := func(req string) []byte {
+		t.Helper()
+		if code, body := post(t, "/v1/messages", req); code != 200 {
+			t.Fatalf("%d %s", code, body)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return got
+	}
+	opening := `{"role":"user","content":[{"type":"text","text":"try my key"}]},` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"use it","signature":"0c53808d-de00-4d61-aa9a-417772c0b84b"},{"type":"tool_use","id":"call_00_a","name":"Bash","input":{"command":"curl -H 'Authorization: Bearer ` + key + `' example.test"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_00_a","content":"ok"}]}`
+	b1 := sent(`{"model":"fake/m1","max_tokens":10,"system":"Be brief.","messages":[` + opening + `]}`)
+	if strings.Contains(string(b1), key) || !strings.Contains(gjson.GetBytes(b1, "messages.1").Raw, "{{API_KEY_") {
+		t.Fatalf("not masked: %s", b1)
+	}
+	if gjson.GetBytes(b1, "messages.2.content.1.text").String() != noteBlock {
+		t.Fatalf("not told after the results: %s", b1)
+	}
+	// the note stays where it is on the next turn, so the prefix holds
+	b2 := sent(`{"model":"fake/m1","max_tokens":10,"system":"Be brief.","messages":[` + opening + `,{"role":"assistant","content":"done"},{"role":"user","content":"thanks"}]}`)
+	for _, path := range []string{"system", "messages.0", "messages.1", "messages.2"} {
+		if gjson.GetBytes(b2, path).Raw != gjson.GetBytes(b1, path).Raw {
+			t.Fatalf("%s changed between turns:\n%s\n%s", path, b1, b2)
+		}
 	}
 }

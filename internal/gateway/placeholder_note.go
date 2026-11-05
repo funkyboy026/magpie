@@ -62,7 +62,10 @@ func notesPlaceholders(p provider.Provider, from provider.Protocol, body []byte)
 // the end of Chat's first system (or developer) message, a part after
 // Gemini's systemInstruction's. Otherwise the earliest message with one
 // says it, after what it has: a text block or part of its own, or a line
-// at the end of a message that is one string. Responses' instructions are
+// at the end of a message that is one string. An Anthropic turn that calls
+// a tool leaves it to the message with the results, after them: DeepSeek's
+// Anthropic API answers text after a tool_use with a 400, on every later
+// turn too, as the history doesn't change. Responses' instructions are
 // never changed (Codex's base_instructions): a developer message of its
 // own goes first in its input, or after the earliest item with one and
 // the tool outputs beside it. On a later turn the same message is the
@@ -119,6 +122,9 @@ func withNoteAnthropic(body []byte) []byte {
 	if i < 0 {
 		return body
 	}
+	if hasToolUse(gjson.GetBytes(body, "messages."+strconv.Itoa(i))) {
+		i++ // after the results; a call with none after it has no place for it
+	}
 	c := gjson.GetBytes(body, "messages."+strconv.Itoa(i)+".content")
 	switch {
 	case c.Type == gjson.String:
@@ -128,6 +134,18 @@ func withNoteAnthropic(body []byte) []byte {
 		return appended(body, c, textPart("text"))
 	}
 	return body
+}
+
+// hasToolUse says whether the Anthropic message m calls a tool the client
+// runs, whose result comes in the next message. A server tool's result is
+// in the same message.
+func hasToolUse(m gjson.Result) bool {
+	for _, b := range m.Get("content").Array() {
+		if b.Get("type").String() == "tool_use" {
+			return true
+		}
+	}
+	return false
 }
 
 func withNoteChat(body []byte) []byte {
